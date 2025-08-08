@@ -1,9 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-WiFi二次认证系统 - 最简启动脚本
-一键启动，自动配置防火墙，并提供生产模式前端服务
-"""
+
+"""WiFi二次认证系统 - 启动脚本（纯Python）"""
+
+def build_tray():
+    # 动态加载可选依赖，避免静态检查的导入错误
+    try:
+        import importlib
+        pystray = importlib.import_module('pystray')
+        pil_image_mod = importlib.import_module('PIL.Image')
+    except ImportError:
+        return None
+
+    icon_path = Path(__file__).parent / 'src' / 'assets' / 'wifiVerify.ico'
+    image = None
+    try:
+        if icon_path.exists():
+            image = pil_image_mod.open(str(icon_path))
+    except OSError:
+        image = None
+
+    # 简化：仅提供打开日志与退出
+    def on_open_logs(_icon, _item):
+        try:
+            os.startfile(str(Path(__file__).parent / 'logs'))
+        except OSError:
+            pass
+
+    def on_exit(icon, _item):
+        icon.visible = False
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem('打开日志目录', on_open_logs),
+        pystray.MenuItem('退出', on_exit)
+    )
+
+    tray = pystray.Icon('VerifyWiFi', image, 'WiFi认证系统', menu)
+    return tray
+ 
 
 import os
 import subprocess
@@ -15,12 +50,39 @@ import ctypes
 import platform
 import threading
 import argparse
+from typing import List, Tuple
+
+# Windows: creation flag to hide child process consoles
+CREATE_NO_WINDOW = 0x08000000 if platform.system() == "Windows" else 0
+ERROR_ALREADY_EXISTS = 183
+class _InstanceState:
+    handle = None
+
+def ensure_single_instance(name: str = "Global\\VerifyWifiSingleInstance") -> bool:
+    """Ensure only one instance runs on Windows using a named mutex.
+    Returns True if this is the first instance; False if another is running.
+    """
+    if platform.system() != "Windows":
+        return True
+    try:
+        # Create or open a named mutex
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
+        last_error = ctypes.windll.kernel32.GetLastError()
+        _InstanceState.handle = handle  # keep reference without使用global
+        if last_error == ERROR_ALREADY_EXISTS:
+            return False
+        return True
+    except OSError:
+        # On error, do not block startup
+        return True
 
 def is_admin():
     """检查当前脚本是否以管理员权限运行 (仅限Windows)"""
+    if platform.system() != "Windows":
+        return False
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
+    except OSError:
         return False
 
 def setup_firewall_rules():
@@ -32,9 +94,7 @@ def setup_firewall_rules():
     print("⚙️  正在配置Windows防火墙规则...")
     rules = {
         "8888": "WiFi Auth Proxy (8888)",
-        "5173": "WiFi Auth Frontend (5173)",
-        "8080": "WiFi Auth API (8080)",
-        "80": "WiFi Captive HTTP (80)"
+        "8080": "WiFi Auth API (8080)"
     }
     success = True
     for port, name in rules.items():
@@ -66,20 +126,78 @@ def setup_firewall_rules():
             success = False
     return success
 
-def get_local_ip():
-    """获取本机在局域网中的IP地址"""
+def _is_private_ipv4(ip: str) -> bool:
+    # RFC1918 + 常见 CGNAT 网段
     try:
-        import psutil
-        for interface, addrs in psutil.net_if_addrs().items():
-            if 'wlan' in interface.lower() or 'wi-fi' in interface.lower() or 'ethernet' in interface.lower():
-                for addr in addrs:
-                    if addr.family == socket.AF_INET:
-                        ip = addr.address
-                        if ip.startswith('192.168.') or ip.startswith('10.') or (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31):
-                            return ip
+        parts = [int(p) for p in ip.split('.')]
+        if len(parts) != 4:
+            return False
+        a, b = parts[0], parts[1]
+        if a == 10:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 192 and b == 168:
+            return True
+        # CGNAT 100.64.0.0/10
+        if a == 100 and 64 <= b <= 127:
+            return True
+        return False
+    except ValueError:
+        return False
+
+
+def _looks_like_vpn_or_virtual(name: str) -> bool:
+    lower = name.lower()
+    keywords = [
+        'vpn', 'anyconnect', 'ppp', 'pptp', 'l2tp', 'ikev2', 'wireguard', 'wg',
+        'zerotier', 'tailscale', 'tun', 'tap', 'vmware', 'virtual', 'hyper-v'
+    ]
+    return any(k in lower for k in keywords)
+
+
+def get_local_ip():
+    """优先选择物理网卡的私网IPv4，避开VPN/虚拟网卡；否则回退socket路由；再回退127.0.0.1。"""
+    # 1) 使用 psutil 精选网卡
+    try:
+        import importlib
+        psutil = importlib.import_module('psutil')
+        preferred_keywords = ['wlan', 'wi-fi', 'ethernet', '以太网', '无线']
+        candidates = []
+        for if_name, addrs in psutil.net_if_addrs().items():
+            if _looks_like_vpn_or_virtual(if_name):
+                continue
+            score = 0
+            lname = if_name.lower()
+            if any(k in lname for k in preferred_keywords):
+                score += 10
+            for addr in addrs:
+                if addr.family == socket.AF_INET:
+                    ip = addr.address
+                    if ip.startswith('127.') or ip.startswith('169.254.'):
+                        continue
+                    if _is_private_ipv4(ip):
+                        candidates.append((score, ip))
+        if candidates:
+            candidates.sort(reverse=True)
+            return candidates[0][1]
+    except (ModuleNotFoundError, ImportError):
+        pass
+
+    # 2) 路由法（可能返回VPN出口）
+    try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(0.1); s.connect(('8.8.8.8', 80)); return s.getsockname()[0]
-    except Exception: return "192.168.1.101"
+            s.settimeout(0.2)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            # 若为公网/非私网，尽量不要用
+            if _is_private_ipv4(ip):
+                return ip
+    except OSError:
+        pass
+
+    # 3) 兜底
+    return "127.0.0.1"
 
 def check_port(host, port, timeout=5):
     """检查端口是否开放"""
@@ -87,7 +205,8 @@ def check_port(host, port, timeout=5):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             return sock.connect_ex((host, port)) == 0
-    except: return False
+    except OSError:
+        return False
 
 def wait_for_service(name, check_func, max_wait=30):
     """等待服务启动"""
@@ -105,53 +224,47 @@ def stream_output(pipe, log_file_path):
             for line in iter(pipe.readline, ''):
                 f.write(line)
                 f.flush()
-    except Exception:
+    except OSError:
         pass # 进程终止时可能出现管道关闭错误，可以忽略
 
-def ensure_node_dependencies(project_root: Path, log_dir: Path):
-    """确保 node 依赖已安装（存在 vite 可执行文件）。若缺失则自动执行 npm ci。"""
-    vite_script = "vite.cmd" if platform.system() == "Windows" else "vite"
-    vite_bin = project_root / "node_modules/.bin" / vite_script
-    if vite_bin.exists():
-        return True
-    print("📦 正在安装前端依赖 (npm ci)...")
-    install_cmd = "npm ci"
-    try:
-        proc = subprocess.Popen(
-            install_cmd,
-            shell=True,
-            cwd=str(project_root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding='utf-8',
-            errors='replace'
-        )
-        npm_log_path = log_dir / "npm_install.log"
-        with open(npm_log_path, 'w', encoding='utf-8') as f:
-            for line in iter(proc.stdout.readline, ''):
-                print(line, end='')
-                f.write(line)
-        code = proc.wait()
-        if code != 0:
-            print("❌ 前端依赖安装失败，请手动运行 npm ci 后重试。")
-            return False
-        print("✅ 前端依赖安装完成。")
-        return True
-    except Exception as e:
-        print(f"❌ 无法自动安装前端依赖: {e}")
-        return False
+# 纯Python模式：移除所有 npm/Vite 相关逻辑
 
 def main():
-    parser = argparse.ArgumentParser(description="WiFi二次认证系统一键启动")
-    parser.add_argument("--skip-build", action="store_true", help="跳过前端打包步骤")
-    parser.add_argument("--force-build", action="store_true", help="无论是否已有 dist 均强制打包")
-    parser.add_argument("--python-serve", action="store_true", help="用Python内置HTTP服务静态dist而不是Node serve")
-    parser.add_argument("--no-frontend", action="store_true", help="不启动前端服务并跳过前端构建/依赖")
-    args = parser.parse_args()
+    # 当前无命令行参数
+    argparse.ArgumentParser(description="WiFi二次认证系统一键启动（纯Python）").parse_args()
     if platform.system() == "Windows" and not is_admin():
         print("ℹ️  需要管理员权限来配置防火墙，正在尝试提权...")
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+        # 区分两种运行形态：
+        # - 非打包(.py)：以 python.exe + 脚本路径 + 参数 启动
+        # - 打包(.exe / PyInstaller frozen)：直接以当前 exe + 参数 启动（不可附加脚本路径，否则 argparse 报 unrecognized arguments）
+        is_frozen = bool(getattr(sys, "frozen", False))
+        if is_frozen:
+            exe_path = sys.executable
+            params = subprocess.list2cmdline(sys.argv[1:])
+            workdir = str(Path(exe_path).parent.resolve())
+            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, workdir, 1)
+        else:
+            try:
+                script_path = os.path.abspath(__file__)
+            except NameError:
+                script_path = sys.argv[0]
+            params = subprocess.list2cmdline([script_path] + sys.argv[1:])
+            workdir = str(Path(script_path).parent.resolve())
+            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, workdir, 1)
+        # ShellExecuteW 返回值 <= 32 表示失败
+        if rc <= 32:
+            try:
+                ctypes.windll.user32.MessageBoxW(0, "提权启动失败，请以管理员身份重新运行此程序。", "WiFi认证系统", 0x00000010)
+            except OSError:
+                pass
+        return
+
+    # Single-instance guard (after elevation)
+    if not ensure_single_instance():
+        try:
+            ctypes.windll.user32.MessageBoxW(0, "程序已在运行中。", "WiFi认证系统", 0x00000040)
+        except OSError:
+            print("程序已在运行中。")
         return
 
     print("=" * 60)
@@ -165,7 +278,7 @@ def main():
     log_dir = project_root / "logs"
     log_dir.mkdir(exist_ok=True)
     
-    processes = []
+    processes: List[Tuple[str, subprocess.Popen]] = []
     threads = []
     local_ip = get_local_ip()
     
@@ -173,57 +286,7 @@ def main():
     env["PYTHONIOENCODING"] = "UTF-8"
     
     try:
-        # --- 0. 无前端模式跳过依赖安装 ---
-        if not args.no_frontend:
-            if not ensure_node_dependencies(project_root, log_dir):
-                raise Exception("自动安装前端依赖失败或未安装 Node/npm。请安装 Node.js 并执行 npm ci 后重试。")
-
-        # --- 1. 打包前端应用（可跳过/强制） ---
-        dist_dir = project_root / "dist"
-        need_build = not args.no_frontend
-        if need_build:
-            if args.skip_build and dist_dir.exists():
-                need_build = False
-            elif dist_dir.exists() and not args.force_build:
-                need_build = False
-
-        if need_build:
-            print("🚀 正在打包前端应用 (npm run build)...")
-            build_process = subprocess.Popen(
-                ["npm", "run", "build"], cwd=project_root, shell=True,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
-                text=True, encoding='utf-8', errors='replace'
-            )
-            build_log_path = log_dir / "build.log"
-            with open(build_log_path, 'w', encoding='utf-8') as f:
-                for line in iter(build_process.stdout.readline, ''):
-                    print(line, end='')
-                    f.write(line)
-            return_code = build_process.wait()
-            if return_code != 0:
-                raise Exception(f"前端打包失败 (npm run build)，请查看上面👆的错误日志以及 logs/build.log 文件。")
-            print("✅ 前端应用打包完成！")
-        else:
-            print("⚡ 跳过打包：使用现有 dist 目录。")
-
-        # --- 2. 启动所有后台服务 ---
-        if not args.no_frontend:
-            # 使用 Vite Preview 提供生产静态资源服务，优先使用本地 vite 可执行文件
-            vite_script = "vite.cmd" if platform.system() == "Windows" else "vite"
-            vite_bin = project_root / "node_modules/.bin" / vite_script
-            if vite_bin.exists():
-                serve_command = [
-                    str(vite_bin), "preview",
-                    "--host", "0.0.0.0",
-                    "--port", "5173",
-                    "--strictPort"
-                ]
-                serve_shell = False
-            else:
-                # 回退到 npm 脚本（需要 npm 在 PATH 中）
-                serve_command = "npm run preview -- --host 0.0.0.0 --port 5173 --strictPort"
-                serve_shell = True
-        
+        # 纯Python：仅启动 API 与 代理
         services = {
             "API服务器": {
                 "command": [sys.executable, str(project_root / "src/pyserver/auth_api.py")],
@@ -244,8 +307,6 @@ def main():
             }
         }
 
-        # 无前端模式：不追加前端服务
-
         for name, config in services.items():
             print(f"🚀 启动 {name}...")
             process = subprocess.Popen(
@@ -257,7 +318,8 @@ def main():
                 errors='replace',
                 env=env,
                 shell=config.get("shell", False),
-                cwd=str(project_root)
+                cwd=str(project_root),
+                creationflags=CREATE_NO_WINDOW
             )
             processes.append((name, process))
 
@@ -268,29 +330,51 @@ def main():
             stdout_thread.start(); stderr_thread.start()
             
             if not wait_for_service(name, config["check"], max_wait=60):
-                raise Exception(f"{name}启动失败")
+                raise RuntimeError(f"{name}启动失败")
 
         print("\n" + "=" * 60)
         print("🎯 系统启动完成！")
         print("=" * 60)
         print("📋 访问地址：")
-        if not args.no_frontend:
-            print(f"  • 认证页面: http://{local_ip}:5173")
-        else:
-            print(f"  • 认证页面(后端HTML): http://{local_ip}:8080/api/auth/fallback")
+        print(f"  • 认证页面(后端HTML): http://{local_ip}:8080/api/auth/fallback")
         print(f"  • API健康检查: http://{local_ip}:8080/api/health")
+        # 输出候选IP，帮助在VPN/虚拟网卡存在时手动选择
+        try:
+            import importlib
+            psutil = importlib.import_module('psutil')
+            all_ips = []
+            for if_name, addrs in psutil.net_if_addrs().items():
+                if _looks_like_vpn_or_virtual(if_name):
+                    continue
+                for addr in addrs:
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        if not ip.startswith('127.') and not ip.startswith('169.254.'):
+                            all_ips.append(ip)
+            if all_ips:
+                print("\n🔎 检测到以下可能可用的IPv4（已排除VPN/虚拟网卡/回环）：")
+                for ip in sorted(set(all_ips)):
+                    note = " ← 当前选择" if ip == local_ip else ""
+                    print(f"  • {ip}{note}")
+        except (ModuleNotFoundError, ImportError):
+            pass
         print("\n📱 手机代理设置：")
         print(f"  • 代理服务器: {local_ip}")
         print("  • 端口: 8888")
         print("\n按 Ctrl+C 停止所有服务...")
         print("=" * 60)
         
-        while True:
-            time.sleep(1)
+        tray = build_tray()
+        if tray is not None and platform.system() == 'Windows':
+            # 进入系统托盘，无控制台环境下也不会退出
+            tray.run()
+        else:
+            while True:
+                time.sleep(1)
             
     except KeyboardInterrupt:
         print("\n用户中断，开始关闭服务...")
-    except Exception as e:
+    except (RuntimeError, OSError) as e:
         print(f"❌ 系统启动失败: {e}")
     finally:
         if processes:
@@ -301,14 +385,25 @@ def main():
                         print(f"   停止 {name}...")
                         process.terminate()
                         process.wait(timeout=5)
-                except Exception as ex:
+                except (OSError, subprocess.SubprocessError) as ex:
                     print(f"   ⚠️  强制停止 {name} 时出错: {ex}")
                     process.kill()
             print("✅ 所有服务已停止")
         
-        # --- 关键改动：在脚本退出前暂停 ---
-        print("\n" + "="*60)
-        input("脚本执行结束。按任意键退出...")
+        # 不再阻塞等待按键，避免“按回车才继续”的卡顿
+
+def _excepthook(exc_type, exc, tb):
+    # 控制台打印
+    import traceback
+    traceback.print_exception(exc_type, exc, tb)
+    # Windows下弹窗提示
+    if platform.system() == 'Windows':
+        try:
+            ctypes.windll.user32.MessageBoxW(0, str(exc), "WiFi认证启动失败", 0x00000010)
+        except OSError:
+            pass
+
 
 if __name__ == "__main__":
+    sys.excepthook = _excepthook
     main()
