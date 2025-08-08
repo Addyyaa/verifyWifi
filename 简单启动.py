@@ -199,12 +199,14 @@ def get_local_ip():
     # 3) 兜底
     return "127.0.0.1"
 
-def check_port(host, port, timeout=5):
+def check_port(host, port, timeout=15):
     """检查端口是否开放"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
-            return sock.connect_ex((host, port)) == 0
+            result = sock.connect_ex((host, port))
+            print(f"检查端口 {host}:{port} 结果: {result}")
+            return result == 0
     except OSError:
         return False
 
@@ -229,9 +231,42 @@ def stream_output(pipe, log_file_path):
 
 # 纯Python模式：移除所有 npm/Vite 相关逻辑
 
+def _run_api_server():
+    """在当前进程启动API服务（用于 --role=api）。"""
+    # 延迟导入，避免主进程无用依赖
+    from src.pyserver import auth_api as _api
+    port = int(os.environ.get('PORT', 8080))
+    _api.logger.info(f"WiFi认证API服务启动: 端口={port}, 调试模式=False")
+    _api.app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+
+
+def _run_proxy_server(host: str, port: int):
+    """在当前进程启动代理服务（用于 --role=proxy）。"""
+    from src.pyserver import wifi_proxy as _proxy
+    # 复用其 main()，通过修改 sys.argv 传参，避免大量改动
+    argv_backup = sys.argv[:]
+    sys.argv = [argv_backup[0], '--host', str(host), '--port', str(port)]
+    try:
+        _proxy.main()
+    finally:
+        sys.argv = argv_backup
+
+
 def main():
-    # 当前无命令行参数
-    argparse.ArgumentParser(description="WiFi二次认证系统一键启动（纯Python）").parse_args()
+    parser = argparse.ArgumentParser(description="WiFi二次认证系统一键启动（纯Python）")
+    parser.add_argument('--role', choices=['api', 'proxy'], help='内部工作角色（打包后子进程使用）')
+    parser.add_argument('--host', default='0.0.0.0', help='代理监听地址（仅 --role=proxy 时有效）')
+    parser.add_argument('--port', type=int, default=8888, help='代理端口（仅 --role=proxy 时有效）')
+    args = parser.parse_args()
+
+    # 子进程模式：不做提权/单实例，直接运行对应服务
+    if args.role == 'api':
+        _run_api_server()
+        return
+    if args.role == 'proxy':
+        _run_proxy_server(args.host, args.port)
+        return
+
     if platform.system() == "Windows" and not is_admin():
         print("ℹ️  需要管理员权限来配置防火墙，正在尝试提权...")
         # 区分两种运行形态：
@@ -286,22 +321,23 @@ def main():
     env["PYTHONIOENCODING"] = "UTF-8"
     
     try:
-        # 纯Python：仅启动 API 与 代理
+        # 仅启动 API 与 代理。打包后用自身exe作为子进程入口，通过 --role 分派
+        is_frozen = bool(getattr(sys, 'frozen', False))
+        if is_frozen:
+            exe_or_py = [sys.executable]
+        else:
+            # 开发环境用 python + 脚本路径
+            script_path = os.path.abspath(__file__)
+            exe_or_py = [sys.executable, script_path]
+
         services = {
             "API服务器": {
-                "command": [sys.executable, str(project_root / "src/pyserver/auth_api.py")],
+                "command": exe_or_py + ["--role", "api"],
                 "check": lambda: check_port("localhost", 8080),
                 "log_file": log_dir / "auth_api.log"
             },
-            # 关键：明确绑定代理到本机局域网IP，避免某些环境下 0.0.0.0 触发 10013 权限错误
             "代理服务器": {
-                "command": [
-                    sys.executable,
-                    str(project_root / "src/pyserver/wifi_proxy.py"),
-                    "--host", "0.0.0.0",
-                    "--port", "8888"
-                ],
-                # 代理应对本机IP开放
+                "command": exe_or_py + ["--role", "proxy", "--host", "0.0.0.0", "--port", "8888"],
                 "check": lambda: (check_port("127.0.0.1", 8888) or check_port(local_ip, 8888)),
                 "log_file": log_dir / "wifi_proxy.log"
             }
