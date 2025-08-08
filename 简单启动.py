@@ -9,13 +9,12 @@ import os
 import subprocess
 import sys
 import time
-import webbrowser
 import socket
-import requests
 from pathlib import Path
 import ctypes
 import platform
 import threading
+import argparse
 
 def is_admin():
     """检查当前脚本是否以管理员权限运行 (仅限Windows)"""
@@ -33,19 +32,32 @@ def setup_firewall_rules():
     print("⚙️  正在配置Windows防火墙规则...")
     rules = {
         "8888": "WiFi Auth Proxy (8888)",
-        "5173": "WiFi Auth Frontend (5173)"
+        "5173": "WiFi Auth Frontend (5173)",
+        "8080": "WiFi Auth API (8080)",
+        "80": "WiFi Captive HTTP (80)"
     }
     success = True
     for port, name in rules.items():
         # 删除可能存在的旧规则以避免冲突
-        subprocess.run(f'netsh advfirewall firewall delete rule name="{name}"', shell=True, capture_output=True)
+        subprocess.run(
+            f'netsh advfirewall firewall delete rule name="{name}"',
+            shell=True,
+            capture_output=True,
+            check=False
+        )
         # 为Python.exe创建特定的规则，更安全
         command = (
             f'netsh advfirewall firewall add rule name="{name}" '
             f'dir=in action=allow protocol=TCP localport={port}'
         )
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, encoding='cp936', errors='ignore'
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding='cp936',
+            errors='ignore',
+            check=False
         )
         if result.returncode == 0:
             print(f"   ✅ 已为端口 {port} 添加入站规则。")
@@ -96,7 +108,47 @@ def stream_output(pipe, log_file_path):
     except Exception:
         pass # 进程终止时可能出现管道关闭错误，可以忽略
 
+def ensure_node_dependencies(project_root: Path, log_dir: Path):
+    """确保 node 依赖已安装（存在 vite 可执行文件）。若缺失则自动执行 npm ci。"""
+    vite_script = "vite.cmd" if platform.system() == "Windows" else "vite"
+    vite_bin = project_root / "node_modules/.bin" / vite_script
+    if vite_bin.exists():
+        return True
+    print("📦 正在安装前端依赖 (npm ci)...")
+    install_cmd = "npm ci"
+    try:
+        proc = subprocess.Popen(
+            install_cmd,
+            shell=True,
+            cwd=str(project_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        npm_log_path = log_dir / "npm_install.log"
+        with open(npm_log_path, 'w', encoding='utf-8') as f:
+            for line in iter(proc.stdout.readline, ''):
+                print(line, end='')
+                f.write(line)
+        code = proc.wait()
+        if code != 0:
+            print("❌ 前端依赖安装失败，请手动运行 npm ci 后重试。")
+            return False
+        print("✅ 前端依赖安装完成。")
+        return True
+    except Exception as e:
+        print(f"❌ 无法自动安装前端依赖: {e}")
+        return False
+
 def main():
+    parser = argparse.ArgumentParser(description="WiFi二次认证系统一键启动")
+    parser.add_argument("--skip-build", action="store_true", help="跳过前端打包步骤")
+    parser.add_argument("--force-build", action="store_true", help="无论是否已有 dist 均强制打包")
+    parser.add_argument("--python-serve", action="store_true", help="用Python内置HTTP服务静态dist而不是Node serve")
+    parser.add_argument("--no-frontend", action="store_true", help="不启动前端服务并跳过前端构建/依赖")
+    args = parser.parse_args()
     if platform.system() == "Windows" and not is_admin():
         print("ℹ️  需要管理员权限来配置防火墙，正在尝试提权...")
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
@@ -121,38 +173,92 @@ def main():
     env["PYTHONIOENCODING"] = "UTF-8"
     
     try:
-        # --- 1. 打包前端应用 ---
-        print("🚀 正在打包前端应用 (npm run build)...")
-        # 使用 shell=True 兼容Windows环境，并直接在控制台显示输出
-        build_process = subprocess.Popen(
-            ["npm", "run", "build"], cwd=project_root, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
-            text=True, encoding='utf-8', errors='replace'
-        )
-        build_log_path = log_dir / "build.log"
-        with open(build_log_path, 'w', encoding='utf-8') as f:
-            for line in iter(build_process.stdout.readline, ''):
-                print(line, end='') # 实时打印到控制台
-                f.write(line) # 同时写入日志
-        
-        return_code = build_process.wait()
-        if return_code != 0:
-            raise Exception(f"前端打包失败 (npm run build)，请查看上面👆的错误日志以及 logs/build.log 文件。")
-        print("✅ 前端应用打包完成！")
+        # --- 0. 无前端模式跳过依赖安装 ---
+        if not args.no_frontend:
+            if not ensure_node_dependencies(project_root, log_dir):
+                raise Exception("自动安装前端依赖失败或未安装 Node/npm。请安装 Node.js 并执行 npm ci 后重试。")
+
+        # --- 1. 打包前端应用（可跳过/强制） ---
+        dist_dir = project_root / "dist"
+        need_build = not args.no_frontend
+        if need_build:
+            if args.skip_build and dist_dir.exists():
+                need_build = False
+            elif dist_dir.exists() and not args.force_build:
+                need_build = False
+
+        if need_build:
+            print("🚀 正在打包前端应用 (npm run build)...")
+            build_process = subprocess.Popen(
+                ["npm", "run", "build"], cwd=project_root, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                text=True, encoding='utf-8', errors='replace'
+            )
+            build_log_path = log_dir / "build.log"
+            with open(build_log_path, 'w', encoding='utf-8') as f:
+                for line in iter(build_process.stdout.readline, ''):
+                    print(line, end='')
+                    f.write(line)
+            return_code = build_process.wait()
+            if return_code != 0:
+                raise Exception(f"前端打包失败 (npm run build)，请查看上面👆的错误日志以及 logs/build.log 文件。")
+            print("✅ 前端应用打包完成！")
+        else:
+            print("⚡ 跳过打包：使用现有 dist 目录。")
 
         # --- 2. 启动所有后台服务 ---
-        serve_script = "serve.cmd" if platform.system() == "Windows" else "serve"
-        serve_command = [str(project_root / "node_modules/.bin" / serve_script), "-s", "dist", "-l", "5173"]
+        if not args.no_frontend:
+            # 使用 Vite Preview 提供生产静态资源服务，优先使用本地 vite 可执行文件
+            vite_script = "vite.cmd" if platform.system() == "Windows" else "vite"
+            vite_bin = project_root / "node_modules/.bin" / vite_script
+            if vite_bin.exists():
+                serve_command = [
+                    str(vite_bin), "preview",
+                    "--host", "0.0.0.0",
+                    "--port", "5173",
+                    "--strictPort"
+                ]
+                serve_shell = False
+            else:
+                # 回退到 npm 脚本（需要 npm 在 PATH 中）
+                serve_command = "npm run preview -- --host 0.0.0.0 --port 5173 --strictPort"
+                serve_shell = True
         
         services = {
-            "API服务器": {"command": [sys.executable, str(project_root / "src/pyserver/auth_api.py")], "check": lambda: check_port("localhost", 8080), "log_file": log_dir / "auth_api.log"},
-            "代理服务器": {"command": [sys.executable, str(project_root / "src/pyserver/wifi_proxy.py"), "--port", "8888"], "check": lambda: check_port("localhost", 8888), "log_file": log_dir / "wifi_proxy.log"},
-            "前端SPA服务器": {"command": serve_command, "check": lambda: check_port(local_ip, 5173), "log_file": log_dir / "frontend.log"}
+            "API服务器": {
+                "command": [sys.executable, str(project_root / "src/pyserver/auth_api.py")],
+                "check": lambda: check_port("localhost", 8080),
+                "log_file": log_dir / "auth_api.log"
+            },
+            # 关键：明确绑定代理到本机局域网IP，避免某些环境下 0.0.0.0 触发 10013 权限错误
+            "代理服务器": {
+                "command": [
+                    sys.executable,
+                    str(project_root / "src/pyserver/wifi_proxy.py"),
+                    "--host", "0.0.0.0",
+                    "--port", "8888"
+                ],
+                # 代理应对本机IP开放
+                "check": lambda: (check_port("127.0.0.1", 8888) or check_port(local_ip, 8888)),
+                "log_file": log_dir / "wifi_proxy.log"
+            }
         }
+
+        # 无前端模式：不追加前端服务
 
         for name, config in services.items():
             print(f"🚀 启动 {name}...")
-            process = subprocess.Popen(config["command"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', env=env)
+            process = subprocess.Popen(
+                config["command"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=env,
+                shell=config.get("shell", False),
+                cwd=str(project_root)
+            )
             processes.append((name, process))
 
             stdout_thread = threading.Thread(target=stream_output, args=(process.stdout, config["log_file"]))
@@ -168,7 +274,10 @@ def main():
         print("🎯 系统启动完成！")
         print("=" * 60)
         print("📋 访问地址：")
-        print(f"  • 认证页面: http://{local_ip}:5173")
+        if not args.no_frontend:
+            print(f"  • 认证页面: http://{local_ip}:5173")
+        else:
+            print(f"  • 认证页面(后端HTML): http://{local_ip}:8080/api/auth/fallback")
         print(f"  • API健康检查: http://{local_ip}:8080/api/health")
         print("\n📱 手机代理设置：")
         print(f"  • 代理服务器: {local_ip}")
@@ -176,7 +285,8 @@ def main():
         print("\n按 Ctrl+C 停止所有服务...")
         print("=" * 60)
         
-        while True: time.sleep(1)
+        while True:
+            time.sleep(1)
             
     except KeyboardInterrupt:
         print("\n用户中断，开始关闭服务...")

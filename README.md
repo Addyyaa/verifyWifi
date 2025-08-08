@@ -1,79 +1,47 @@
-# WiFi 网络认证页面
+# WiFi 二次认证系统（后端纯 HTML 认证页）
 
-一个现代化的WiFi二次认证页面，采用React + TypeScript + Vite构建，提供安全、美观、易用的网络接入验证体验。
+一个轻量的 WiFi 二次认证系统：显式 HTTP 代理 + Python 后端。未认证时拦截 HTTP 流量并引导至后端输出的纯 HTML 认证/成功页面（兼容 iOS/Android 迷你浏览器）。
 
-## ✨ 特性
-
-- 🎨 **现代化UI设计** - 采用扁平化设计风格，支持深色主题
-- 📱 **响应式布局** - 完美适配各种设备和屏幕尺寸
-- ♿ **无障碍性支持** - 遵循WCAG 2.1 AA标准，支持屏幕阅读器
-- 🔒 **安全认证** - 内置表单验证和错误处理机制
-- ⚡ **高性能** - 使用Vite构建，支持热模块替换(HMR)
-- 🌐 **国际化友好** - 中文界面，支持键盘导航
-
+## ✨ 功能
+- 未认证 HTTP：返回 302 或 511，跳转/提示认证
+- 未认证 HTTPS：拒绝 CONNECT 隧道（技术限制，无法 302）
+- 认证页/成功页：后端直接返回纯 HTML（响应式、无 JS 依赖）
+- 认证管理：基于设备 IP 的会话（SQLite + WAL）
+- 日志：写入 `logs/` 目录
 ## 🚀 快速开始
 
 ### 系统要求
 
 - Python 3.8+
-- Node.js 16+
-- npm 或 yarn
 
 ### 一键启动（推荐）
 
 ```bash
 # 安装Python依赖
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
-# 启动完整系统（包括代理、API和前端）
-python start_auth_system.py
+# 启动（无前端模式）
+python 简单启动.py --no-frontend
 ```
 
-系统启动后将自动运行：
-- 🔌 API服务器: http://localhost:8080
-- 📡 代理服务器: localhost:8888
-- 🌐 Web管理界面: http://localhost:8081
-- 💻 前端认证页面: http://localhost:5173
+系统启动后：
+- 🔌 API: http://<你的局域网IP>:8080
+- 📡 代理: <你的局域网IP>:8888
+- 📝 认证页（后端 HTML）：http://<你的局域网IP>:8080/api/auth/fallback
 
 ### 手动启动（开发模式）
 
 #### 1. 安装依赖
 
-```bash
-# Python依赖
-pip install -r requirements.txt
-
-# 前端依赖
-npm install
-```
-
-#### 2. 启动API服务器
-
-```bash
-cd src/pyserver
-python auth_api.py
-```
-
-#### 3. 启动代理服务器
-
-```bash
-mitmdump -s src/pyserver/verifyWifi.py --listen-port 8888 --web-port 8081
-```
-
-#### 4. 启动前端开发服务器
-
-```bash
-npm run dev
-```
 
 ### 客户端配置
 
 将需要认证的设备的网络代理设置为：
-- **代理服务器**: localhost 或服务器IP
+- **代理服务器**: 你的局域网IP
 - **端口**: 8888
-- **协议**: HTTP
+- **协议**: HTTP（系统代理应同时作用于 HTTPS；建议关闭浏览器 QUIC/HTTP3）
 
-## 🔐 认证信息
+## 🔐 默认凭据
 
 默认的认证凭据：
 - **用户名**: `addyya`
@@ -84,48 +52,27 @@ npm run dev
 1. **设备连接**: 用户设备连接到WiFi网络
 2. **代理拦截**: 设备访问网络时被代理服务器拦截
 3. **认证检查**: 系统检查设备是否已通过认证
-4. **跳转认证**: 未认证设备被重定向到认证页面
+4. **跳转认证**: 未认证设备被重定向到认证页面（HTTP）；HTTPS 未认证时连接将被拒绝
 5. **用户认证**: 用户输入凭据进行身份验证
 6. **会话创建**: 认证成功后创建会话令牌
 7. **网络访问**: 已认证设备可正常访问网络
 8. **会话管理**: 系统管理会话有效期和设备状态
 
-## 📁 项目结构
+## 📁 项目结构（精简后）
 
 ```
 ├── src/
-│   ├── pages/
-│   │   ├── VerifyWifiPage.tsx    # WiFi认证页面组件
-│   │   └── VerifyWifiPage.css    # 页面样式文件
-│   ├── pyserver/
-│   │   ├── verifyWifi.py         # 代理服务器主脚本
-│   │   └── auth_api.py           # REST API服务器
-│   ├── css/
-│   │   └── App.css               # 应用主样式
-│   ├── App.tsx                   # 应用根组件
-│   ├── main.tsx                  # 应用入口文件
-│   └── index.css                 # 全局样式
-├── start_auth_system.py          # 系统启动脚本
-├── config.json                   # 系统配置文件
-├── requirements.txt              # Python依赖列表
-├── package.json                  # Node.js依赖配置
-└── README.md                     # 项目文档
+│   └── pyserver/
+│       ├── wifi_proxy.py      # 显式 HTTP 代理
+│       └── auth_api.py        # 认证 API（纯 HTML 认证/成功页）
+├── 简单启动.py                 # 一键启动
+├── wifi_auth.db               # SQLite（首次运行自动初始化）
+├── requirements.txt           # Python 依赖
+└── README.md
 ```
 
-## 🎛️ 系统架构
-
-```mermaid
-graph TB
-    A[客户端设备] --> B[代理服务器<br/>:8888]
-    B --> C{设备已认证?}
-    C -->|否| D[认证页面<br/>:5173]
-    C -->|是| E[正常访问网络]
-    D --> F[API服务器<br/>:8080]
-    F --> G[SQLite数据库]
-    F -->|认证成功| H[创建会话]
-    H --> E
-    I[Web管理界面<br/>:8081] --> B
-```
+## 🎯 重要说明
+- 显式代理无法对“未经过代理的直连 HTTPS”做重定向，只能拒绝连接。若需强制，需在网关/防火墙层阻断直连 443，或使用 PAC/WPAD/透明网关。
 
 ## 🎯 核心功能
 

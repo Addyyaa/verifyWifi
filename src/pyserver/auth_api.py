@@ -10,7 +10,7 @@ import sqlite3
 import hashlib
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, make_response
 from flask_cors import CORS
 from typing import Dict, Optional, Tuple
 import os
@@ -225,7 +225,7 @@ class AuthManager:
             """, (ip_address, user_agent, ip_address, 
                   datetime.now().isoformat(), datetime.now().isoformat(), expires_at.isoformat()))
             
-            # 停用该IP的旧会话
+            # 停用该IP的旧会话（确保后续查询只返回有效一条）
             cursor.execute("""
                 UPDATE device_sessions 
                 SET is_active = 0 
@@ -336,21 +336,24 @@ def health_check():
 def login():
     """用户登录接口"""
     try:
-        # 获取请求数据
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': '请求数据格式错误'
-            }), 400
-        
-        username = data.get('username', '').strip()
-        password = data.get('password', '')
+        # 解析请求数据（JSON 或 表单）
+        data = request.get_json(silent=True) or {}
+        username = (data.get('username') or request.form.get('username') or '').strip()
+        password = (data.get('password') or request.form.get('password') or '')
         client_ip = auth_manager.get_client_ip(request)
         user_agent = request.headers.get('User-Agent', '')
         
         # 验证必填字段
         if not username or not password:
+            # 若期望 HTML 响应，则返回简单HTML
+            if 'text/html' in (request.headers.get('Accept') or '').lower():
+                html = """
+                <html><body>
+                <p>用户名和密码不能为空</p>
+                <a href="/api/auth/fallback">返回</a>
+                </body></html>
+                """
+                return Response(html, status=400, mimetype='text/html; charset=utf-8')
             return jsonify({
                 'success': False,
                 'error': '用户名和密码不能为空'
@@ -383,6 +386,55 @@ def login():
             
             logger.info(f"用户登录成功: IP={client_ip}, 用户={username}")
             
+            # 如浏览器希望HTML，返回美化后的纯HTML成功页（兼容门户迷你浏览器）
+            if 'text/html' in (request.headers.get('Accept') or '').lower():
+                redirect_url = request.args.get('redirect') or 'https://pinturalife.com/pages/about-us-1'
+                html = f"""
+                <!doctype html>
+                <html lang=\"zh-CN\">
+                <head>
+                  <meta charset=\"utf-8\" />
+                  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+                  <title>认证成功</title>
+                  <meta http-equiv=\"refresh\" content=\"3;url={redirect_url}\">
+                  <style>
+                    :root {{
+                      --primary: #28a745;
+                      --bg: #f6f8fb;
+                      --card-bg: #ffffff;
+                      --text: #1f2937;
+                      --muted: #6b7280;
+                      --shadow: 0 10px 25px rgba(0,0,0,0.08);
+                    }}
+                    * {{ box-sizing: border-box; }}
+                    html,body {{ height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }}
+                    .wrap {{ min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 16px; }}
+                    .card {{ width: 100%; max-width: 480px; background: var(--card-bg); border-radius: 16px; box-shadow: var(--shadow); padding: 24px; text-align: center; }}
+                    .icon {{ width: 64px; height: 64px; margin: 8px auto 16px; border-radius: 50%; background: rgba(40,167,69,0.12); display:flex; align-items:center; justify-content:center; }}
+                    .icon svg {{ width: 36px; height: 36px; fill: var(--primary); }}
+                    h1 {{ margin: 0 0 8px; font-size: 22px; }}
+                    p {{ margin: 6px 0; color: var(--muted); line-height: 1.6; }}
+                    .btn {{ display:inline-block; margin-top: 14px; padding: 10px 16px; background: var(--primary); color: #fff; text-decoration: none; border-radius: 10px; }}
+                    .hint {{ margin-top: 8px; font-size: 12px; color: var(--muted); }}
+                    @media (max-width: 360px) {{ .card {{ padding: 18px; border-radius: 12px; }} h1 {{ font-size: 18px; }} }}
+                  </style>
+                </head>
+                <body>
+                  <div class=\"wrap\">
+                    <div class=\"card\" role=\"status\" aria-live=\"polite\"> 
+                      <div class=\"icon\" aria-hidden=\"true\">
+                        <svg viewBox=\"0 0 24 24\"><path d=\"M9 16.2l-3.5-3.5-1.4 1.4L9 19 20.3 7.7l-1.4-1.4z\"/></svg>
+                      </div>
+                      <h1>认证成功</h1>
+                      <p>现在可以正常访问互联网。</p>
+                      <a class=\"btn\" href=\"{redirect_url}\">立即进入</a>
+                      <p class=\"hint\">将在 3 秒后自动跳转</p>
+                    </div>
+                  </div>
+                </body>
+                </html>
+                """
+                return Response(html, mimetype='text/html; charset=utf-8')
             return jsonify({
                 'success': True,
                 'message': '认证成功',
@@ -395,7 +447,14 @@ def login():
             })
         else:
             logger.warning(f"用户登录失败: IP={client_ip}, 用户={username}")
-            
+            if 'text/html' in (request.headers.get('Accept') or '').lower():
+                html = """
+                <html><body>
+                <p>用户名或密码错误</p>
+                <a href="/api/auth/fallback">返回</a>
+                </body></html>
+                """
+                return Response(html, status=401, mimetype='text/html; charset=utf-8')
             return jsonify({
                 'success': False,
                 'error': '用户名或密码错误'
@@ -403,10 +462,71 @@ def login():
     
     except Exception as e:
         logger.error(f"登录接口异常: {e}")
+        if 'text/html' in (request.headers.get('Accept') or '').lower():
+            return Response("<html><body><p>服务器内部错误</p></body></html>", status=500, mimetype='text/html; charset=utf-8')
         return jsonify({
             'success': False,
             'error': '服务器内部错误'
         }), 500
+
+@app.route('/api/auth/fallback', methods=['GET'])
+def fallback_login_form():
+    """提供简易的纯HTML登录表单，兼容旧版/受限浏览器。"""
+    client_ip = auth_manager.get_client_ip(request)
+    redirect_url = request.args.get('redirect') or 'http://neverssl.com'
+    html = f"""
+    <!doctype html>
+    <html lang=\"zh-CN\">
+    <head>
+      <meta charset=\"utf-8\" />
+      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+      <title>网络认证</title>
+      <style>
+        :root {{
+          --primary: #2563eb;
+          --bg: #f3f4f6;
+          --card: #ffffff;
+          --text: #111827;
+          --muted: #6b7280;
+          --shadow: 0 10px 25px rgba(0,0,0,.08);
+        }}
+        * {{ box-sizing: border-box; }}
+        html,body {{ height:100%; margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; }}
+        .wrap {{ min-height:100%; display:flex; align-items:center; justify-content:center; padding:16px; }}
+        .card {{ width:100%; max-width:420px; background:var(--card); border-radius:16px; box-shadow:var(--shadow); padding:22px; }}
+        h3 {{ margin:6px 0 14px; text-align:center; font-size:20px; }}
+        .row {{ margin-bottom:12px; }}
+        label {{ display:block; margin-bottom:6px; color:var(--muted); font-size:14px; }}
+        input {{ width:100%; padding:12px; border:1px solid #e5e7eb; border-radius:10px; font-size:16px; }}
+        button {{ width:100%; padding:12px; margin-top:6px; background:var(--primary); color:#fff; border:0; border-radius:10px; font-size:16px; }}
+        .hint {{ color:var(--muted); font-size:12px; margin-top:10px; text-align:center; }}
+        .ip {{ margin-top:6px; font-size:12px; color:#9ca3af; text-align:center; }}
+        @media (max-width:360px) {{ .card {{ padding:16px; border-radius:12px; }} }}
+      </style>
+    </head>
+    <body>
+      <div class=\"wrap\"> 
+        <div class=\"card\">
+          <h3>WiFi 网络认证</h3>
+          <form action=\"/api/auth/login\" method=\"post\" accept-charset=\"utf-8\">
+            <div class=\"row\">
+              <label>用户名</label>
+              <input name=\"username\" type=\"text\" required />
+            </div>
+            <div class=\"row\">
+              <label>密码</label>
+              <input name=\"password\" type=\"password\" required />
+            </div>
+            <button type=\"submit\">登录</button>
+          </form>
+          <div class=\"ip\">客户端IP: {client_ip}</div>
+          <div class=\"hint\">登录成功后将自动放行上网。如未跳转，请手动访问 <a href=\"{redirect_url}\">{redirect_url}</a></div>
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+    return Response(html, mimetype='text/html; charset=utf-8')
 
 @app.route('/api/auth/verify', methods=['POST'])
 def verify_session():

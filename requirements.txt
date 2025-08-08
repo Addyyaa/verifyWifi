@@ -1,5 +1,4 @@
-# WiFi二次认证系统依赖
-mitmproxy>=10.0.0
+# WiFi二次认证系统依赖（无前端）
 flask==3.0.0
 flask-cors==4.0.0
-requests==2.31.0
+psutil>=5.9.0
