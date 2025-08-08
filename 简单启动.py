@@ -3,41 +3,344 @@
 
 """WiFi二次认证系统 - 启动脚本（纯Python）"""
 
-def build_tray():
+def build_tray(exit_event=None):
     # 动态加载可选依赖，避免静态检查的导入错误
+    import importlib
     try:
-        import importlib
         pystray = importlib.import_module('pystray')
+    except ImportError:
+        pystray = None
+    try:
         pil_image_mod = importlib.import_module('PIL.Image')
     except ImportError:
-        return None
+        pil_image_mod = None
 
     icon_path = Path(__file__).parent / 'src' / 'assets' / 'wifiVerify.ico'
-    image = None
-    try:
-        if icon_path.exists():
-            image = pil_image_mod.open(str(icon_path))
-    except OSError:
-        image = None
 
-    # 简化：仅提供打开日志与退出
+    # 简化：仅提供打开主页面/日志与退出
     def on_open_logs(_icon, _item):
         try:
             os.startfile(str(Path(__file__).parent / 'logs'))
         except OSError:
             pass
 
+    def on_open_main(_icon=None, _item=None):
+        try:
+            import webbrowser
+        except ImportError:
+            webbrowser = None
+        try:
+            # 动态获取当前可用IP
+            url = f"http://{get_local_ip()}:8080/api/auth/fallback"
+            if webbrowser is not None:
+                webbrowser.open(url)
+            else:
+                os.startfile(url)
+        except Exception:
+            pass
     def on_exit(icon, _item):
         icon.visible = False
         icon.stop()
+        try:
+            # 通知主线程退出
+            if exit_event is not None:
+                exit_event.set()
+        except Exception:
+            pass
 
-    menu = pystray.Menu(
-        pystray.MenuItem('打开日志目录', on_open_logs),
-        pystray.MenuItem('退出', on_exit)
-    )
+    if pystray is not None and pil_image_mod is not None:
+        # 构造图像（Pillow）
+        image = None
+        try:
+            if icon_path.exists():
+                image = pil_image_mod.open(str(icon_path))
+        except OSError:
+            image = None
+        if image is None:
+            try:
+                image = pil_image_mod.new('RGBA', (16, 16), (0, 122, 255, 255))
+            except Exception:
+                image = None
+        if image is None:
+            # 若仍失败，回退到原生托盘
+            pass
+        else:
+            try:
+                menu = pystray.Menu(
+                    pystray.MenuItem('打开认证页面', on_open_main),
+                    pystray.MenuItem('打开日志目录', on_open_logs),
+                    pystray.MenuItem('退出', on_exit)
+                )
+                tray = pystray.Icon('WiFiVerifyTray', image, 'WiFi认证系统', menu)
+                return tray
+            except Exception:
+                pass
 
-    tray = pystray.Icon('VerifyWiFi', image, 'WiFi认证系统', menu)
-    return tray
+    # 若 pystray 不可用或 Pillow 不可用，回退 Win32 原生托盘
+    # ---- Fallback: 使用 Win32 原生托盘（pywin32）----
+    try:
+        import win32api
+        import win32con
+        import win32gui
+        import win32gui_struct
+
+        class _Win32Tray:
+            def __init__(self):
+                # 延迟到 run() 再创建窗口和图标
+                self.hInstance = None
+                self.className = 'WiFiVerifyTrayWndClass'
+                self.hwnd = None
+                self.hicon = None
+                self.menu = None
+                self._visible = False
+
+            def _on_destroy(self, hwnd, msg, wparam, lparam):
+                nid = (self.hwnd, 0)
+                try:
+                    win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, nid)
+                except win32gui.error:
+                    pass
+                win32gui.PostQuitMessage(0)
+                return True
+
+            def _on_command(self, hwnd, msg, wparam, lparam):
+                cmd = win32api.LOWORD(wparam)
+                if cmd == 1024:
+                    on_open_logs(None, None)
+                elif cmd == 1025:
+                    try:
+                        if exit_event is not None:
+                            exit_event.set()
+                    except Exception:
+                        pass
+                    win32gui.DestroyWindow(self.hwnd)
+                return True
+
+            def _on_notify(self, hwnd, msg, wparam, lparam):
+                if lparam == win32con.WM_RBUTTONUP or lparam == win32con.WM_CONTEXTMENU:
+                    pos = win32gui.GetCursorPos()
+                    win32gui.SetForegroundWindow(self.hwnd)
+                    win32gui.TrackPopupMenu(self.menu, win32con.TPM_LEFTALIGN, pos[0], pos[1], 0, self.hwnd, None)
+                    win32gui.PostMessage(self.hwnd, win32con.WM_NULL, 0, 0)
+                return True
+
+            # pystray 接口兼容
+            def run(self):
+                self.hInstance = win32api.GetModuleHandle(None)
+                message_map = {
+                    win32con.WM_COMMAND: self._on_command,
+                    win32con.WM_DESTROY: self._on_destroy,
+                    win32con.WM_USER+20: self._on_notify,
+                }
+                wndclass = win32gui.WNDCLASS()
+                wndclass.hInstance = self.hInstance
+                wndclass.lpszClassName = self.className
+                wndclass.lpfnWndProc = message_map
+                try:
+                    win32gui.RegisterClass(wndclass)
+                except win32gui.error:
+                    pass
+                self.hwnd = win32gui.CreateWindow(
+                    self.className,
+                    'WiFiVerify',
+                    0,
+                    0, 0, 0, 0,
+                    0, 0, self.hInstance, None
+                )
+                if icon_path.exists():
+                    self.hicon = win32gui.LoadImage(0, str(icon_path), win32con.IMAGE_ICON, 16, 16, win32con.LR_LOADFROMFILE)
+                else:
+                    self.hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+                nid = (
+                    self.hwnd,
+                    0,
+                    win32gui.NIF_MESSAGE | win32gui.NIF_ICON | win32gui.NIF_TIP,
+                    win32con.WM_USER+20,
+                    self.hicon,
+                    'WiFi认证系统'
+                )
+                win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
+                self.menu = win32gui.CreatePopupMenu()
+                win32gui.AppendMenu(self.menu, win32con.MF_STRING, 1023, '打开认证页面')
+                win32gui.AppendMenu(self.menu, win32con.MF_STRING, 1024, '打开日志目录')
+                win32gui.AppendMenu(self.menu, win32con.MF_STRING, 1025, '退出')
+                self._visible = True
+                win32gui.PumpMessages()
+
+            def stop(self):
+                try:
+                    win32gui.DestroyWindow(self.hwnd)
+                except win32gui.error:
+                    pass
+
+            def notify(self, text):
+                try:
+                    nid = (
+                        self.hwnd,
+                        0,
+                        win32gui.NIF_INFO,
+                        win32con.WM_USER+20,
+                        self.hicon,
+                        'WiFi认证系统',
+                        text,
+                        200,
+                        '提示'
+                    )
+                    win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, nid)
+                except win32gui.error:
+                    pass
+
+            @property
+            def visible(self):
+                return self._visible
+
+            @visible.setter
+            def visible(self, v):
+                self._visible = v
+
+        return _Win32Tray()
+    except Exception:
+        return None
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem('打开认证页面', on_open_main),
+                pystray.MenuItem('打开日志目录', on_open_logs),
+                pystray.MenuItem('退出', on_exit)
+            )
+            tray = pystray.Icon('WiFiVerifyTray', image, 'WiFi认证系统', menu)
+            return tray
+        except Exception:
+            pass
+
+    # ---- Fallback: 使用 Win32 原生托盘（pywin32）----
+    try:
+        import win32api
+        import win32con
+        import win32gui
+        import win32gui_struct
+
+        class _Win32Tray:
+            def __init__(self):
+                self.hInstance = win32api.GetModuleHandle(None)
+                self.className = 'WiFiVerifyTrayWndClass'
+                message_map = {
+                    win32con.WM_COMMAND: self._on_command,
+                    win32con.WM_DESTROY: self._on_destroy,
+                    win32con.WM_USER+20: self._on_notify,
+                }
+                wndclass = win32gui.WNDCLASS()
+                wndclass.hInstance = self.hInstance
+                wndclass.lpszClassName = self.className
+                wndclass.lpfnWndProc = message_map
+                try:
+                    win32gui.RegisterClass(wndclass)
+                except win32gui.error:
+                    pass
+                self.hwnd = win32gui.CreateWindow(
+                    self.className,
+                    'WiFiVerify',
+                    0,
+                    0, 0, 0, 0,
+                    0, 0, self.hInstance, None
+                )
+                # 图标
+                if icon_path.exists():
+                    hicon = win32gui.LoadImage(0, str(icon_path), win32con.IMAGE_ICON, 16, 16, win32con.LR_LOADFROMFILE)
+                else:
+                    hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+                self.hicon = hicon
+                # 使用 PackNOTIFYICONDATA，确保兼容 Win10/11 托盘消息
+                nid = win32gui_struct.PackNOTIFYICONDATA(
+                    self.hwnd, 0, win32con.NIF_MESSAGE | win32con.NIF_ICON | win32con.NIF_TIP,
+                    win32con.WM_USER+20, self.hicon, 'WiFi认证系统'
+                )
+                try:
+                    win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
+                    # 设置版本为 4，启用高级行为
+                    nid2 = win32gui_struct.PackNOTIFYICONDATA(self.hwnd, 0)
+                    nid2.uVersion = 4
+                    win32gui.Shell_NotifyIcon(0x00000004, nid2)  # NIM_SETVERSION = 4
+                except win32gui.error:
+                    pass
+                # 菜单
+                self.menu = win32gui.CreatePopupMenu()
+                win32gui.AppendMenu(self.menu, win32con.MF_STRING, 1023, '打开认证页面')
+                win32gui.AppendMenu(self.menu, win32con.MF_STRING, 1024, '打开日志目录')
+                win32gui.AppendMenu(self.menu, win32con.MF_STRING, 1025, '退出')
+                self._visible = True
+
+            def _on_destroy(self, hwnd, msg, wparam, lparam):
+                nid = (self.hwnd, 0)
+                try:
+                    win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, nid)
+                except win32gui.error:
+                    pass
+                win32gui.PostQuitMessage(0)
+                return True
+
+            def _on_command(self, hwnd, msg, wparam, lparam):
+                cmd = win32api.LOWORD(wparam)
+                if cmd == 1023:
+                    on_open_main()
+                elif cmd == 1024:
+                    on_open_logs(None, None)
+                elif cmd == 1025:
+                    try:
+                        if exit_event is not None:
+                            exit_event.set()
+                    except Exception:
+                        pass
+                    # 终止主循环，让 finally 块回收所有子进程
+                    try:
+                        win32gui.PostQuitMessage(0)
+                    except Exception:
+                        pass
+                return True
+
+            def _on_notify(self, hwnd, msg, wparam, lparam):
+                if lparam in (win32con.WM_RBUTTONUP, win32con.WM_CONTEXTMENU):
+                    pos = win32gui.GetCursorPos()
+                    win32gui.SetForegroundWindow(self.hwnd)
+                    cmd = win32gui.TrackPopupMenu(
+                        self.menu,
+                        win32con.TPM_LEFTALIGN | win32con.TPM_RETURNCMD | win32con.TPM_RIGHTBUTTON,
+                        pos[0], pos[1], 0, self.hwnd, None
+                    )
+                    if cmd:
+                        win32gui.PostMessage(self.hwnd, win32con.WM_COMMAND, cmd, 0)
+                elif lparam in (win32con.WM_LBUTTONDBLCLK, win32con.WM_LBUTTONUP):
+                    on_open_main()
+                return True
+
+            # pystray 接口兼容
+            def run(self):
+                win32gui.PumpMessages()
+
+            def stop(self):
+                try:
+                    win32gui.DestroyWindow(self.hwnd)
+                except win32gui.error:
+                    pass
+
+            def notify(self, text):
+                try:
+                    flags = win32gui.NIF_INFO
+                    nid = (self.hwnd, 0, flags, win32con.WM_USER+20, self.hicon, 'WiFi认证系统', text, 200, '提示')
+                    win32gui.Shell_NotifyIcon(win32gui.NIM_MODIFY, nid)
+                except win32gui.error:
+                    pass
+
+            @property
+            def visible(self):
+                return self._visible
+
+            @visible.setter
+            def visible(self, v):
+                self._visible = v
+
+        return _Win32Tray()
+    except Exception:
+        return None
  
 
 import os
@@ -47,6 +350,8 @@ import time
 import socket
 from pathlib import Path
 import ctypes
+import msvcrt
+from tempfile import gettempdir
 import platform
 import threading
 import argparse
@@ -55,26 +360,61 @@ from typing import List, Tuple
 # Windows: creation flag to hide child process consoles
 CREATE_NO_WINDOW = 0x08000000 if platform.system() == "Windows" else 0
 ERROR_ALREADY_EXISTS = 183
+CONTROL_UDP_PORT = 49621  # 本地UDP端口用于激活已运行实例
 class _InstanceState:
     handle = None
+    lock_file_handle = None
+    lock_file_path = None
+    control_sock = None
 
-def ensure_single_instance(name: str = "Global\\VerifyWifiSingleInstance") -> bool:
-    """Ensure only one instance runs on Windows using a named mutex.
-    Returns True if this is the first instance; False if another is running.
-    """
-    if platform.system() != "Windows":
-        return True
+def ensure_single_instance(name: str = "VerifyWifiSingleInstance") -> bool:
+    """Windows下使用本地会话互斥 + 文件锁双保险，确保单实例运行。"""
+    # 1) Windows命名互斥（会话内），避免管理员/普通用户跨会话不可见问题
+    if platform.system() == "Windows":
+        try:
+            mutex_name = f"Local\\{name}"
+            handle = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+            last_error = ctypes.windll.kernel32.GetLastError()
+            _InstanceState.handle = handle
+            if last_error == ERROR_ALREADY_EXISTS:
+                return False
+        except OSError:
+            # 互斥创建异常不阻塞，继续进行文件锁
+            pass
+
+    # 2) 文件锁（跨平台可用），作为双保险
     try:
-        # Create or open a named mutex
-        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
-        last_error = ctypes.windll.kernel32.GetLastError()
-        _InstanceState.handle = handle  # keep reference without使用global
-        if last_error == ERROR_ALREADY_EXISTS:
+        base_dir = os.getenv('LOCALAPPDATA') or gettempdir()
+        app_dir = Path(base_dir) / 'VerifyWifi'
+        app_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = app_dir / 'app.lock'
+        f = open(lock_path, 'a+')
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            try:
+                f.close()
+            except OSError:
+                pass
             return False
+        _InstanceState.lock_file_handle = f
+        _InstanceState.lock_file_path = str(lock_path)
+    except OSError:
+        # 文件锁失败不影响，但可能导致双开；尽量通过互斥已拦截
+        pass
+    return True
+
+
+def _acquire_udp_lock() -> bool:
+    """尝试绑定本地 UDP 端口作为系统级单实例锁。绑定成功即为首个实例。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('127.0.0.1', CONTROL_UDP_PORT))
+        _InstanceState.control_sock = s
         return True
     except OSError:
-        # On error, do not block startup
-        return True
+        return False
 
 def is_admin():
     """检查当前脚本是否以管理员权限运行 (仅限Windows)"""
@@ -229,6 +569,16 @@ def stream_output(pipe, log_file_path):
     except OSError:
         pass # 进程终止时可能出现管道关闭错误，可以忽略
 
+
+def _send_activate_signal():
+    """向已运行实例发送激活信号。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.2)
+            s.sendto(b'ACTIVATE', ('127.0.0.1', CONTROL_UDP_PORT))
+    except OSError:
+        pass
+
 # 纯Python模式：移除所有 npm/Vite 相关逻辑
 
 def _run_api_server():
@@ -253,10 +603,19 @@ def _run_proxy_server(host: str, port: int):
 
 
 def main():
+    def _can_build_tray() -> bool:
+        try:
+            import importlib
+            importlib.import_module('pystray')
+            importlib.import_module('PIL.Image')
+            return True
+        except ImportError:
+            return False
     parser = argparse.ArgumentParser(description="WiFi二次认证系统一键启动（纯Python）")
     parser.add_argument('--role', choices=['api', 'proxy'], help='内部工作角色（打包后子进程使用）')
     parser.add_argument('--host', default='0.0.0.0', help='代理监听地址（仅 --role=proxy 时有效）')
     parser.add_argument('--port', type=int, default=8888, help='代理端口（仅 --role=proxy 时有效）')
+    parser.add_argument('--elevate-firewall', action='store_true', help='以管理员权限仅执行防火墙配置后退出')
     args = parser.parse_args()
 
     # 子进程模式：不做提权/单实例，直接运行对应服务
@@ -267,35 +626,52 @@ def main():
         _run_proxy_server(args.host, args.port)
         return
 
+    # 仅防火墙提权模式：管理员执行后立即退出
+    if args.elevate_firewall:
+        ok = setup_firewall_rules()
+        # 写入标记文件，避免后续重复提权
+        try:
+            base_dir = os.getenv('LOCALAPPDATA') or gettempdir()
+            app_dir = Path(base_dir) / 'VerifyWifi'
+            app_dir.mkdir(parents=True, exist_ok=True)
+            (app_dir / 'firewall.ok').write_text('ok', encoding='utf-8')
+        except OSError:
+            pass
+        sys.exit(0 if ok else 1)
+
+    # 常规模式：主进程不提权。仅当未配置过防火墙时，后台发起一次性提权子进程执行 --elevate-firewall
     if platform.system() == "Windows" and not is_admin():
-        print("ℹ️  需要管理员权限来配置防火墙，正在尝试提权...")
-        # 区分两种运行形态：
-        # - 非打包(.py)：以 python.exe + 脚本路径 + 参数 启动
-        # - 打包(.exe / PyInstaller frozen)：直接以当前 exe + 参数 启动（不可附加脚本路径，否则 argparse 报 unrecognized arguments）
-        is_frozen = bool(getattr(sys, "frozen", False))
-        if is_frozen:
-            exe_path = sys.executable
-            params = subprocess.list2cmdline(sys.argv[1:])
-            workdir = str(Path(exe_path).parent.resolve())
-            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, workdir, 1)
-        else:
+        need_firewall = True
+        try:
+            base_dir = os.getenv('LOCALAPPDATA') or gettempdir()
+            app_dir = Path(base_dir) / 'VerifyWifi'
+            marker = app_dir / 'firewall.ok'
+            need_firewall = not marker.exists()
+        except OSError:
+            pass
+        if need_firewall:
             try:
-                script_path = os.path.abspath(__file__)
-            except NameError:
-                script_path = sys.argv[0]
-            params = subprocess.list2cmdline([script_path] + sys.argv[1:])
-            workdir = str(Path(script_path).parent.resolve())
-            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, workdir, 1)
-        # ShellExecuteW 返回值 <= 32 表示失败
-        if rc <= 32:
-            try:
-                ctypes.windll.user32.MessageBoxW(0, "提权启动失败，请以管理员身份重新运行此程序。", "WiFi认证系统", 0x00000010)
+                is_frozen = bool(getattr(sys, "frozen", False))
+                if is_frozen:
+                    exe_path = sys.executable
+                    workdir = str(Path(exe_path).parent.resolve())
+                    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, "--elevate-firewall", workdir, 0)
+                else:
+                    try:
+                        script_path = os.path.abspath(__file__)
+                    except NameError:
+                        script_path = sys.argv[0]
+                    workdir = str(Path(script_path).parent.resolve())
+                    params = subprocess.list2cmdline([script_path, "--elevate-firewall"])
+                    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, workdir, 0)
             except OSError:
                 pass
-        return
+
+    # 后台模式已取消：关闭控制台仅隐藏，不再派生新进程
 
     # Single-instance guard (after elevation)
-    if not ensure_single_instance():
+    if not ensure_single_instance() or not _acquire_udp_lock():
+        _send_activate_signal()
         try:
             ctypes.windll.user32.MessageBoxW(0, "程序已在运行中。", "WiFi认证系统", 0x00000040)
         except OSError:
@@ -303,11 +679,9 @@ def main():
         return
 
     print("=" * 60)
-    print("🎉 WiFi二次认证系统 - 启动程序 (管理员模式)")
+    print("🎉 WiFi二次认证系统 - 启动程序")
     print("=" * 60)
-    if not setup_firewall_rules():
-        print("❌ 防火墙配置失败，请检查权限或手动配置。")
-        return # 直接退出
+    # 防火墙配置已由一次性提权子进程处理；此处不再阻塞
     
     project_root = Path(__file__).parent
     log_dir = project_root / "logs"
@@ -320,6 +694,74 @@ def main():
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "UTF-8"
     
+    # --- Windows 控制台关闭 -> 隐藏到托盘，仅托盘“退出”才真正退出 ---
+    def _hide_console_window():
+        if platform.system() == 'Windows':
+            try:
+                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+            except OSError:
+                pass
+
+    _console_handler_ref = None
+    if platform.system() == 'Windows':
+        try:
+            HandlerRoutine = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+            def _handler(ctrl_type):
+                # CTRL_CLOSE/LOGOFF/SHUTDOWN -> 仅隐藏控制台，托盘与服务保持
+                if ctrl_type in (2, 5, 6):
+                    _hide_console_window()
+                    try:
+                        ctypes.windll.kernel32.FreeConsole()
+                    except OSError:
+                        pass
+                    return True
+                return False
+            _console_handler_ref = HandlerRoutine(_handler)
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(_console_handler_ref, True)
+        except OSError:
+            _console_handler_ref = None
+
+    # 预先创建托盘并后台运行，确保任何时刻都可见
+    exit_event = threading.Event()
+    tray = None
+    if platform.system() == 'Windows':
+        tray = build_tray(exit_event=exit_event)
+        if tray is not None:
+            try:
+                # 统一用线程运行，确保与某些桌面环境兼容
+                t = threading.Thread(target=tray.run, daemon=True)
+                t.start()
+                try:
+                    tray.visible = True
+                    tray.notify('程序已在后台运行，右键此图标可退出。')
+                    print('ℹ️ 托盘已创建并后台运行。')
+                except Exception:
+                    pass
+            except Exception:
+                tray = None
+                print('⚠️ 托盘创建失败，将无托盘运行。')
+
+    # 启动UDP控制监听线程：接受ACTIVATE以显示通知（提示程序已运行）
+    def _control_server():
+        if _InstanceState.control_sock is None:
+            return
+        s = _InstanceState.control_sock
+        while True:
+            try:
+                data, _ = s.recvfrom(32)
+            except OSError:
+                break
+            if data == b'ACTIVATE':
+                try:
+                    if tray is not None:
+                        tray.notify('程序已在运行。')
+                except Exception:
+                    pass
+
+    threading.Thread(target=_control_server, daemon=True).start()
+
     try:
         # 仅启动 API 与 代理。打包后用自身exe作为子进程入口，通过 --role 分派
         is_frozen = bool(getattr(sys, 'frozen', False))
@@ -329,7 +771,7 @@ def main():
             # 开发环境用 python + 脚本路径
             script_path = os.path.abspath(__file__)
             exe_or_py = [sys.executable, script_path]
-
+        
         services = {
             "API服务器": {
                 "command": exe_or_py + ["--role", "api"],
@@ -400,10 +842,10 @@ def main():
         print("\n按 Ctrl+C 停止所有服务...")
         print("=" * 60)
         
-        tray = build_tray()
-        if tray is not None and platform.system() == 'Windows':
-            # 进入系统托盘，无控制台环境下也不会退出
-            tray.run()
+        # 主线程等待托盘退出事件；若托盘不可用，则保持运行
+        if tray is not None:
+            while not exit_event.is_set():
+                time.sleep(0.2)
         else:
             while True:
                 time.sleep(1)

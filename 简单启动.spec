@@ -13,6 +13,7 @@ a = Analysis(
         'flask_cors', 
         'psutil',
         'pystray',
+        'win32api','win32con','win32gui',
         'src.pyserver.auth_api',
         'src.pyserver.wifi_proxy'
     ],
