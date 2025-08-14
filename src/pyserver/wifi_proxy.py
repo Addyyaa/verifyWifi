@@ -587,8 +587,8 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def get_auth_server_ip() -> str:
     """获取并缓存本机局域网IP，避免频繁调用psutil。"""
     global AUTH_SERVER_IP
-    # if AUTH_SERVER_IP:
-    #     return AUTH_SERVER_IP
+    if AUTH_SERVER_IP:
+        return AUTH_SERVER_IP
     AUTH_SERVER_IP = get_local_ip()
     return AUTH_SERVER_IP
 
